@@ -49,7 +49,7 @@ export function getConfig() {
   return {
     telegramToken: token,
     adminIds,
-    checkIntervalMs: intervalMinutes * 60 * 1000 * 5,
+    checkIntervalMs: intervalMinutes * 60 * 1000,
     dataFile: path.resolve(process.env.DATA_FILE ?? "./data/opsbot.json"),
   };
 }
