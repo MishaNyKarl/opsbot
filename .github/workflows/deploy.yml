@@ -24,14 +24,14 @@ jobs:
 
       - name: Create release archive
         run: |
+          mkdir -p "$RUNNER_TEMP/opsbot-release"
           tar \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='.env' \
             --exclude='data' \
             --exclude='node_modules' \
-            --exclude='opsbot.tar.gz' \
-            -czf opsbot.tar.gz .
+            -czf "$RUNNER_TEMP/opsbot-release/opsbot.tar.gz" .
 
       - name: Configure SSH
         env:
@@ -50,7 +50,7 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           ssh "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
-          scp opsbot.tar.gz "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/opsbot.tar.gz"
+          scp "$RUNNER_TEMP/opsbot-release/opsbot.tar.gz" "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/opsbot.tar.gz"
 
       - name: Restart bot
         env:
