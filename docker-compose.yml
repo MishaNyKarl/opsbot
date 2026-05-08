@@ -1,0 +1,12 @@
+services:
+  opsbot:
+    build:
+      context: .
+    container_name: opsbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_FILE: /data/opsbot.json
+    volumes:
+      - ./data:/data

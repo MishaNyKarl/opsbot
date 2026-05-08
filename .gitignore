@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+!.env.production.example
+data/
+node_modules/
+npm-debug.log*
+proxyline_doc.txt

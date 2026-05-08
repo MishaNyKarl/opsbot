@@ -1,0 +1,594 @@
+import { formatCheckReport, getExpiredCount } from "./monitor.js";
+import { escapeHtml } from "./telegram.js";
+
+const SERVICE_NAMES = {
+  porkbun: "Porkbun",
+  proxyline: "Proxyline",
+  darkshopping: "Darkshopping",
+};
+
+export class Bot {
+  constructor({ storage, telegram, monitor, bootstrapAdminIds }) {
+    this.storage = storage;
+    this.telegram = telegram;
+    this.monitor = monitor;
+    this.bootstrapAdminIds = bootstrapAdminIds;
+    this.offset = 0;
+    this.pendingInputs = new Map();
+  }
+
+  async startPolling() {
+    for (;;) {
+      try {
+        const updates = await this.telegram.getUpdates(this.offset, 30);
+        for (const update of updates) {
+          this.offset = update.update_id + 1;
+          if (update.message?.text) await this.handleMessage(update.message);
+          if (update.callback_query) await this.handleCallback(update.callback_query);
+        }
+      } catch (error) {
+        console.error("Ошибка polling:", error.message);
+        await wait(3000);
+      }
+    }
+  }
+
+  async handleMessage(message) {
+    const chatId = String(message.chat.id);
+    await this.ensureUser(message);
+
+    const text = message.text.trim();
+    const pending = this.pendingInputs.get(chatId);
+
+    try {
+      if (pending && !text.startsWith("/")) {
+        return this.handlePendingInput(message, pending, text);
+      }
+
+      if (text === "/start" || text === "/menu" || text === "/help") {
+        return this.showMainMenu(chatId, message.from.id);
+      }
+      if (text === "/id") {
+        return this.sendText(chatId, `Ваш Telegram ID: ${chatId}`, mainMenuKeyboard());
+      }
+
+      return this.showMainMenu(chatId, message.from.id);
+    } catch (error) {
+      return this.sendText(chatId, `Ошибка: ${error.message}`, mainMenuKeyboard());
+    }
+  }
+
+  async handleCallback(query) {
+    const chatId = String(query.message.chat.id);
+    const userId = String(query.from.id);
+    const data = query.data;
+
+    await this.ensureUserFromCallback(query);
+    await this.telegram.answerCallbackQuery(query.id);
+    this.pendingInputs.delete(chatId);
+
+    try {
+      if (data === "menu") return this.showMainMenu(chatId, userId);
+      if (data === "help") return this.showHelp(chatId, userId);
+      if (data === "my_accounts") return this.showBuyerAccounts(chatId, userId);
+      if (data === "check_my") return this.runManualCheck(chatId, userId);
+      if (data === "expired_my") return this.runManualCheck(chatId, userId, null, { showExpired: true });
+      if (data.startsWith("check_account:")) {
+        return this.runManualCheck(chatId, userId, data.slice("check_account:".length));
+      }
+      if (data.startsWith("expired_account:")) {
+        return this.runManualCheck(chatId, userId, data.slice("expired_account:".length), { showExpired: true });
+      }
+
+      if (data === "admin") return this.adminOnly(chatId, userId, () => this.showAdminMenu(chatId));
+      if (data === "pending_users") return this.adminOnly(chatId, userId, () => this.showPendingUsers(chatId));
+      if (data.startsWith("approve:")) {
+        return this.adminOnly(chatId, userId, () => this.approveUser(chatId, data.slice("approve:".length)));
+      }
+      if (data === "buyers") return this.adminOnly(chatId, userId, () => this.showBuyers(chatId));
+      if (data.startsWith("buyer:")) {
+        return this.adminOnly(chatId, userId, () => this.showBuyerCard(chatId, data.slice("buyer:".length)));
+      }
+      if (data.startsWith("add_account:")) {
+        return this.adminOnly(chatId, userId, () => this.chooseService(chatId, data.slice("add_account:".length)));
+      }
+      if (data.startsWith("service:")) {
+        const [, buyerId, service] = data.split(":");
+        return this.adminOnly(chatId, userId, () => this.askAccountData(chatId, buyerId, service));
+      }
+      if (data === "all_accounts") return this.adminOnly(chatId, userId, () => this.showAllAccounts(chatId));
+      if (data.startsWith("account:")) {
+        return this.showAccountCard(chatId, userId, data.slice("account:".length));
+      }
+      if (data.startsWith("set_balance:")) {
+        return this.askBalanceThreshold(chatId, userId, data.slice("set_balance:".length));
+      }
+      if (data.startsWith("set_expiry:")) {
+        return this.askExpiryThreshold(chatId, userId, data.slice("set_expiry:".length));
+      }
+      if (data.startsWith("remove_account:")) {
+        return this.adminOnly(chatId, userId, () => this.confirmRemoveAccount(chatId, data.slice("remove_account:".length)));
+      }
+      if (data.startsWith("confirm_remove_account:")) {
+        return this.adminOnly(chatId, userId, () => this.removeAccount(chatId, data.slice("confirm_remove_account:".length)));
+      }
+
+      return this.sendText(chatId, "Не понял действие. Вернул главное меню.", mainMenuKeyboard());
+    } catch (error) {
+      return this.sendText(chatId, `Ошибка: ${error.message}`, mainMenuKeyboard());
+    }
+  }
+
+  async ensureUser(message) {
+    const telegramId = String(message.from.id);
+    const existing = this.storage.getUser(telegramId);
+    const isBootstrapAdmin = this.bootstrapAdminIds.has(telegramId);
+    const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
+
+    if (!existing) {
+      await this.storage.upsertUser({
+        telegramId,
+        username: message.from.username ?? "",
+        name,
+        role: isBootstrapAdmin ? "admin" : "buyer",
+        status: isBootstrapAdmin ? "active" : "pending",
+      });
+      return;
+    }
+
+    const patch = { telegramId, username: message.from.username ?? "", name };
+    if (isBootstrapAdmin && existing.role !== "admin") {
+      patch.role = "admin";
+      patch.status = "active";
+    }
+    await this.storage.upsertUser(patch);
+  }
+
+  async ensureUserFromCallback(query) {
+    await this.ensureUser({
+      from: query.from,
+      chat: query.message.chat,
+      text: "/menu",
+    });
+  }
+
+  async showMainMenu(chatId, userId) {
+    const user = this.storage.getUser(userId);
+
+    if (user?.role === "admin" && user.status === "active") {
+      return this.sendText(
+        chatId,
+        "Главное меню администратора.\nВыберите действие кнопками ниже.",
+        keyboard([
+          [{ text: "Админка", callback_data: "admin" }],
+          [{ text: "Мои аккаунты", callback_data: "my_accounts" }],
+          [{ text: "Проверить сейчас", callback_data: "check_my" }],
+          [{ text: "Помощь", callback_data: "help" }],
+        ]),
+      );
+    }
+
+    if (user?.status !== "active") {
+      return this.sendText(
+        chatId,
+        [
+          "Вы зарегистрированы, но доступ еще не подтвержден администратором.",
+          `Ваш Telegram ID: ${chatId}`,
+          "После подтверждения я пришлю сообщение.",
+        ].join("\n"),
+        keyboard([[{ text: "Обновить статус", callback_data: "menu" }]]),
+      );
+    }
+
+    return this.sendText(
+      chatId,
+      "Главное меню баера.",
+      keyboard([
+        [{ text: "Мои аккаунты", callback_data: "my_accounts" }],
+        [{ text: "Проверить сейчас", callback_data: "check_my" }],
+        [{ text: "Помощь", callback_data: "help" }],
+      ]),
+    );
+  }
+
+  async showHelp(chatId, userId) {
+    const user = this.storage.getUser(userId);
+    const text = [
+      "Бот следит за балансами и сроками окончания сервисов.",
+      "",
+      "Баер видит свои аккаунты и может запустить ручную проверку.",
+      "Админ подтверждает пользователей, добавляет аккаунты и задает пороги уведомлений.",
+      "",
+      "Почти все действия доступны кнопками. Текстом нужно отправлять только API-ключи, названия и числа порогов.",
+      "",
+      `Ваш Telegram ID: ${chatId}`,
+    ].join("\n");
+
+    return this.sendText(chatId, text, user?.role === "admin" ? adminBackKeyboard() : mainMenuKeyboard());
+  }
+
+  async showAdminMenu(chatId) {
+    const pendingCount = this.storage.listUsers().filter((user) => user.status === "pending").length;
+
+    return this.sendText(
+      chatId,
+      `Админка.\nНовых заявок: ${pendingCount}`,
+      keyboard([
+        [{ text: `Заявки на доступ (${pendingCount})`, callback_data: "pending_users" }],
+        [{ text: "Баеры", callback_data: "buyers" }],
+        [{ text: "Все аккаунты", callback_data: "all_accounts" }],
+        [{ text: "Назад", callback_data: "menu" }],
+      ]),
+    );
+  }
+
+  async showPendingUsers(chatId) {
+    const users = this.storage.listUsers().filter((user) => user.status === "pending");
+    if (!users.length) return this.sendText(chatId, "Новых заявок нет.", adminBackKeyboard());
+
+    return this.sendText(
+      chatId,
+      "Заявки на доступ:",
+      keyboard([
+        ...users.map((user) => [
+          {
+            text: `Подтвердить ${formatUserShort(user)}`,
+            callback_data: `approve:${user.telegramId}`,
+          },
+        ]),
+        [{ text: "Назад", callback_data: "admin" }],
+      ]),
+    );
+  }
+
+  async approveUser(chatId, telegramId) {
+    const existing = this.storage.getUser(telegramId);
+    if (!existing) {
+      await this.storage.upsertUser({ telegramId, role: "buyer", status: "active" });
+    } else {
+      await this.storage.setUserRole(telegramId, existing.role === "admin" ? "admin" : "buyer");
+    }
+
+    await this.safeNotify(
+      telegramId,
+      "Доступ подтвержден. Теперь вы можете пользоваться ботом.",
+      keyboard([
+        [{ text: "Открыть меню", callback_data: "menu" }],
+        [{ text: "Мои аккаунты", callback_data: "my_accounts" }],
+      ]),
+    );
+
+    return this.sendText(
+      chatId,
+      `Пользователь ${telegramId} подтвержден. Я отправил ему уведомление.`,
+      adminBackKeyboard(),
+    );
+  }
+
+  async showBuyers(chatId) {
+    const buyers = this.storage
+      .listUsers()
+      .filter((user) => user.role === "buyer" && user.status === "active");
+
+    if (!buyers.length) return this.sendText(chatId, "Активных баеров пока нет.", adminBackKeyboard());
+
+    return this.sendText(
+      chatId,
+      "Баеры:",
+      keyboard([
+        ...buyers.map((user) => [{ text: formatUserShort(user), callback_data: `buyer:${user.telegramId}` }]),
+        [{ text: "Назад", callback_data: "admin" }],
+      ]),
+    );
+  }
+
+  async showBuyerCard(chatId, buyerId) {
+    const buyer = this.storage.getUser(buyerId);
+    if (!buyer) throw new Error("Баер не найден.");
+
+    const accounts = this.storage.listAccounts({ buyerTelegramId: buyerId });
+    return this.sendText(
+      chatId,
+      [`Баер: ${formatUserShort(buyer)}`, `ID: ${buyer.telegramId}`, `Аккаунтов: ${accounts.length}`].join("\n"),
+      keyboard([
+        [{ text: "Добавить аккаунт", callback_data: `add_account:${buyer.telegramId}` }],
+        ...accounts.map((account) => [{ text: accountLabel(account), callback_data: `account:${account.id}` }]),
+        [{ text: "Назад", callback_data: "buyers" }],
+      ]),
+    );
+  }
+
+  async chooseService(chatId, buyerId) {
+    return this.sendText(
+      chatId,
+      "Какой сервис добавить баеру?",
+      keyboard([
+        [{ text: "Proxyline", callback_data: `service:${buyerId}:proxyline` }],
+        [{ text: "Porkbun", callback_data: `service:${buyerId}:porkbun` }],
+        [{ text: "Darkshopping", callback_data: `service:${buyerId}:darkshopping` }],
+        [{ text: "Назад", callback_data: `buyer:${buyerId}` }],
+      ]),
+    );
+  }
+
+  async askAccountData(chatId, buyerId, service) {
+    this.pendingInputs.set(String(chatId), { type: "add_account", buyerId, service });
+    const example = service === "porkbun" ? "Название API_KEY SECRET_KEY" : "Название API_KEY";
+
+    return this.sendText(
+      chatId,
+      [
+        `Добавляем ${SERVICE_NAMES[service]}.`,
+        "Отправьте данные одним сообщением:",
+        example,
+        "",
+        "Название лучше писать без пробелов, например proxyline_main.",
+      ].join("\n"),
+      keyboard([[{ text: "Отмена", callback_data: `buyer:${buyerId}` }]]),
+    );
+  }
+
+  async showAllAccounts(chatId) {
+    const accounts = this.storage.listAccounts();
+    if (!accounts.length) return this.sendText(chatId, "Аккаунтов пока нет.", adminBackKeyboard());
+
+    return this.sendText(
+      chatId,
+      "Все аккаунты:",
+      keyboard([
+        ...accounts.map((account) => [{ text: accountLabel(account), callback_data: `account:${account.id}` }]),
+        [{ text: "Назад", callback_data: "admin" }],
+      ]),
+    );
+  }
+
+  async showBuyerAccounts(chatId, userId) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    const accounts = this.storage.listAccounts({ buyerTelegramId: user.telegramId });
+    if (!accounts.length) {
+      return this.sendText(chatId, "За вами пока не закреплены аккаунты.", mainMenuKeyboard());
+    }
+
+    return this.sendText(
+      chatId,
+      "Ваши аккаунты:",
+      keyboard([
+        ...accounts.map((account) => [{ text: accountLabel(account), callback_data: `account:${account.id}` }]),
+        [{ text: "Проверить все", callback_data: "check_my" }],
+        [{ text: "Назад", callback_data: "menu" }],
+      ]),
+    );
+  }
+
+  async showAccountCard(chatId, userId, accountId) {
+    const account = this.storage.getAccount(accountId);
+    if (!account) throw new Error("Аккаунт не найден.");
+    const user = this.storage.getUser(userId);
+    const isOwner = account.buyerTelegramId === String(userId);
+    const isAdmin = user?.role === "admin" && user.status === "active";
+
+    if (!isOwner && !isAdmin) {
+      return this.sendText(chatId, "Этот аккаунт вам не доступен.", mainMenuKeyboard());
+    }
+
+    const buttons = [[{ text: "Проверить сейчас", callback_data: `check_account:${account.id}` }]];
+    if (isOwner) {
+      buttons.push([{ text: "Настроить баланс", callback_data: `set_balance:${account.id}` }]);
+      buttons.push([{ text: "Настроить срок", callback_data: `set_expiry:${account.id}` }]);
+    }
+    if (isAdmin) {
+      buttons.push([{ text: "Удалить аккаунт", callback_data: `remove_account:${account.id}` }]);
+    }
+    buttons.push([{ text: "Назад", callback_data: isAdmin && !isOwner ? `buyer:${account.buyerTelegramId}` : "my_accounts" }]);
+
+    return this.sendText(
+      chatId,
+      [
+        accountLabel(account),
+        `ID: ${account.id}`,
+        `Баер: ${account.buyerTelegramId}`,
+        `Порог баланса: ${account.balanceThreshold ?? "не задан"}`,
+        `Уведомлять за: ${account.expiryThresholdDays ?? "не задано"} дн.`,
+      ].join("\n"),
+      keyboard(buttons),
+    );
+  }
+
+  async askBalanceThreshold(chatId, userId, accountId) {
+    this.ensureAccountOwner(userId, accountId);
+    this.pendingInputs.set(String(chatId), { type: "set_balance", accountId, ownerId: String(userId) });
+    return this.sendText(
+      chatId,
+      "Отправьте число: при каком балансе присылать уведомление.\nНапример: 50",
+      keyboard([[{ text: "Отмена", callback_data: `account:${accountId}` }]]),
+    );
+  }
+
+  async askExpiryThreshold(chatId, userId, accountId) {
+    this.ensureAccountOwner(userId, accountId);
+    this.pendingInputs.set(String(chatId), { type: "set_expiry", accountId, ownerId: String(userId) });
+    return this.sendText(
+      chatId,
+      "Отправьте число дней до окончания, когда нужно прислать уведомление.\nНапример: 7",
+      keyboard([[{ text: "Отмена", callback_data: `account:${accountId}` }]]),
+    );
+  }
+
+  async handlePendingInput(message, pending, text) {
+    const chatId = String(message.chat.id);
+    this.pendingInputs.delete(chatId);
+
+    if (pending.type === "add_account") {
+      const [name, apiKey, secretApiKey] = text.split(/\s+/);
+      if (!name || !apiKey || (pending.service === "porkbun" && !secretApiKey)) {
+        await this.sendText(chatId, "Не хватает данных. Попробуйте еще раз.", adminBackKeyboard());
+        return this.askAccountData(chatId, pending.buyerId, pending.service);
+      }
+
+      const account = await this.storage.addAccount({
+        buyerTelegramId: pending.buyerId,
+        service: pending.service,
+        name,
+        credentials: { apiKey, secretApiKey: secretApiKey ?? "" },
+      });
+
+      return this.sendText(
+        chatId,
+        `Аккаунт добавлен.\n${accountLabel(account)}\nID: ${account.id}`,
+        keyboard([[{ text: "Открыть аккаунт", callback_data: `account:${account.id}` }]]),
+      );
+    }
+
+    if (pending.type === "set_balance") {
+      this.ensureAccountOwner(message.from.id, pending.accountId);
+      const amount = Number(text.replace(",", "."));
+      if (!Number.isFinite(amount)) throw new Error("Нужно отправить число.");
+      await this.storage.updateAccount(pending.accountId, { balanceThreshold: amount });
+      return this.sendText(
+        chatId,
+        `Порог баланса сохранен: ${amount}.`,
+        keyboard([[{ text: "К аккаунту", callback_data: `account:${pending.accountId}` }]]),
+      );
+    }
+
+    if (pending.type === "set_expiry") {
+      this.ensureAccountOwner(message.from.id, pending.accountId);
+      const days = Number.parseInt(text, 10);
+      if (!Number.isInteger(days) || days < 0) throw new Error("Нужно отправить целое число дней.");
+      await this.storage.updateAccount(pending.accountId, { expiryThresholdDays: days });
+      return this.sendText(
+        chatId,
+        `Порог срока сохранен: ${days} дн.`,
+        keyboard([[{ text: "К аккаунту", callback_data: `account:${pending.accountId}` }]]),
+      );
+    }
+  }
+
+  ensureAccountOwner(userId, accountId) {
+    const account = this.storage.getAccount(accountId);
+    if (!account) throw new Error("Аккаунт не найден.");
+    if (account.buyerTelegramId !== String(userId)) {
+      throw new Error("Пороги уведомлений может менять только владелец аккаунта.");
+    }
+    return account;
+  }
+
+  async removeAccount(chatId, accountId) {
+    const account = this.storage.getAccount(accountId);
+    if (!account) throw new Error("Аккаунт не найден.");
+    await this.storage.removeAccount(accountId);
+    return this.sendText(chatId, `Аккаунт удален: ${accountLabel(account)}`, adminBackKeyboard());
+  }
+
+  async confirmRemoveAccount(chatId, accountId) {
+    const account = this.storage.getAccount(accountId);
+    if (!account) throw new Error("Аккаунт не найден.");
+
+    return this.sendText(
+      chatId,
+      `Удалить аккаунт?\n${accountLabel(account)}\nID: ${account.id}`,
+      keyboard([
+        [{ text: "Да, удалить", callback_data: `confirm_remove_account:${account.id}` }],
+        [{ text: "Отмена", callback_data: `account:${account.id}` }],
+      ]),
+    );
+  }
+
+  async runManualCheck(chatId, userId, accountId = null, options = {}) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    const accounts =
+      user.role === "admin"
+        ? this.storage.listAccounts({ accountId })
+        : this.storage
+            .listAccounts({ buyerTelegramId: user.telegramId })
+            .filter((account) => !accountId || account.id === accountId);
+
+    if (!accounts.length) return this.sendText(chatId, "Подходящих аккаунтов нет.", mainMenuKeyboard());
+
+    await this.sendText(chatId, options.showExpired ? "Собираю истекшие..." : "Проверяю...");
+    const reports = [];
+    for (const account of accounts) {
+      reports.push(...(await this.monitor.checkAll({ accountId: account.id })));
+    }
+
+    const expiredCount = reports.reduce((sum, report) => sum + getExpiredCount(report), 0);
+    return this.sendText(
+      chatId,
+      reports.map((report) => formatCheckReport(report, { showExpired: options.showExpired })).join("\n\n"),
+      checkResultKeyboard({ accountId, showExpired: options.showExpired, expiredCount }),
+    );
+  }
+
+  async adminOnly(chatId, userId, action) {
+    const user = this.storage.getUser(userId);
+    if (user?.role !== "admin" || user.status !== "active") {
+      return this.sendText(chatId, "Этот раздел доступен только администратору.", mainMenuKeyboard());
+    }
+    return action();
+  }
+
+  async sendText(chatId, text, replyMarkup = undefined) {
+    const extra = replyMarkup ? { reply_markup: replyMarkup } : {};
+    return this.telegram.sendMessage(chatId, escapeHtml(text), extra);
+  }
+
+  async safeNotify(chatId, text, replyMarkup = undefined) {
+    try {
+      await this.sendText(chatId, text, replyMarkup);
+    } catch (error) {
+      console.error(`Не удалось отправить сообщение ${chatId}:`, error.message);
+    }
+  }
+}
+
+function keyboard(inlineKeyboard) {
+  return { inline_keyboard: inlineKeyboard };
+}
+
+function mainMenuKeyboard() {
+  return keyboard([[{ text: "В меню", callback_data: "menu" }]]);
+}
+
+function adminBackKeyboard() {
+  return keyboard([[{ text: "Назад в админку", callback_data: "admin" }]]);
+}
+
+function checkResultKeyboard({ accountId, showExpired, expiredCount }) {
+  const rows = [];
+  if (!showExpired && expiredCount > 0) {
+    rows.push([
+      {
+        text: `Показать истекшие (${expiredCount})`,
+        callback_data: accountId ? `expired_account:${accountId}` : "expired_my",
+      },
+    ]);
+  }
+  if (showExpired) {
+    rows.push([
+      {
+        text: "К актуальным",
+        callback_data: accountId ? `check_account:${accountId}` : "check_my",
+      },
+    ]);
+  }
+  rows.push([{ text: "В меню", callback_data: "menu" }]);
+  return keyboard(rows);
+}
+
+function accountLabel(account) {
+  return `${SERVICE_NAMES[account.service] ?? account.service}: ${account.name}`;
+}
+
+function formatUserShort(user) {
+  const username = user.username ? `@${user.username}` : "";
+  const name = user.name || "без имени";
+  return `${name} ${username}`.trim() || user.telegramId;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

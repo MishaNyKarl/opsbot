@@ -1,0 +1,7 @@
+.git
+.github
+.env
+data
+node_modules
+npm-debug.log*
+proxyline_doc.txt
