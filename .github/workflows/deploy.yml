@@ -69,6 +69,13 @@ jobs:
               exit 1
             fi
             cd app
-            docker compose up -d --build
+            if docker compose version >/dev/null 2>&1; then
+              docker compose up -d --build
+            elif command -v docker-compose >/dev/null 2>&1; then
+              docker-compose up -d --build
+            else
+              echo 'Docker Compose is not installed. Install docker-compose-plugin on the server.' >&2
+              exit 1
+            fi
             docker image prune -f
           "
