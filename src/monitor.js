@@ -76,17 +76,36 @@ export class Monitor {
           if (this.storage.hasSentAlert(key)) continue;
 
           const message = [
-            "Уведомление об окончании срока",
+            item.kind === "payment" ? "Уведомление об оплате" : "Уведомление об окончании срока",
             `Сервис: ${account.service}`,
             `Аккаунт: ${account.name}`,
             `Объект: ${item.label}`,
             `Окончание: ${formatDate(item.endsAt)}`,
+            item.amountDue !== undefined ? `Сумма к оплате: ${formatMoney(item.amountDue, item.currency)}` : null,
             `Срок: ${formatDaysLeft(item.endsAt)}`,
-          ].join("\n");
+          ].filter(Boolean).join("\n");
           await this.notifyAccount(account, message);
           await this.storage.markAlertSent(key);
           report.alerts.push(message);
         }
+      }
+
+      for (const status of snapshot.statuses ?? []) {
+        if (status.status !== "error") continue;
+
+        const key = ["status", account.id, status.id, "error", new Date().toISOString().slice(0, 10)].join(":");
+        if (this.storage.hasSentAlert(key)) continue;
+
+        const message = [
+          "Alert: сервер Datalix в статусе error",
+          `Сервис: ${account.service}`,
+          `Аккаунт: ${account.name}`,
+          `Сервер: ${status.label}`,
+          `Статус: ${status.statusLabel ?? status.status}`,
+        ].join("\n");
+        await this.notifyAccount(account, message);
+        await this.storage.markAlertSent(key);
+        report.alerts.push(message);
       }
     } catch (error) {
       report.error = error;
@@ -129,19 +148,26 @@ export function formatCheckReport(report, options = {}) {
     .filter((item) => item.endsAt && (showExpired ? isExpired(item.endsAt) : !isExpired(item.endsAt)))
     .sort((a, b) => new Date(a.endsAt) - new Date(b.endsAt))
     .slice(0, 8)
-    .map((item, index) => `${index + 1}. ${item.label}\n   ${formatDate(item.endsAt)} (${formatDaysLeft(item.endsAt)})`);
-  const title = showExpired ? "Истекшие прокси и домены" : "Ближайшие окончания";
+    .map((item, index) => {
+      const amount = item.amountDue !== undefined ? `\n   К оплате: ${formatMoney(item.amountDue, item.currency)}` : "";
+      return `${index + 1}. ${item.label}\n   ${formatDate(item.endsAt)} (${formatDaysLeft(item.endsAt)})${amount}`;
+    });
+  const statusErrors = (report.snapshot.statuses ?? [])
+    .filter((status) => status.status === "error")
+    .map((status, index) => `${index + 1}. ${status.label} — ${status.statusLabel ?? status.status}`);
+  const title = showExpired ? "Истекшие прокси, домены и серверы" : "Ближайшие окончания и оплаты";
   const emptyText = showExpired
-    ? "Истекшие прокси и домены: нет"
-    : "Ближайшие окончания: нет активных объектов со сроками";
+    ? "Истекшие прокси, домены и серверы: нет"
+    : "Ближайшие окончания и оплаты: нет активных объектов со сроками";
 
   return [
     `Аккаунт: ${report.account.name}`,
     `Сервис: ${formatService(report.account.service)}`,
     `Баланс: ${balance}`,
+    statusErrors.length ? `Ошибки статуса:\n${statusErrors.join("\n")}` : null,
     "",
     expiring.length ? `${title}:\n${expiring.join("\n")}` : emptyText,
-  ].join("\n");
+  ].filter((line) => line !== null).join("\n");
 }
 
 export function getExpiredCount(report) {
@@ -163,6 +189,11 @@ function formatBalance(balance) {
   if (balance.display?.includes(amount)) return balance.display;
   if (!balance.display || balance.display === amount) return amount;
   return `${amount} (${balance.display})`;
+}
+
+function formatMoney(amount, currency = "") {
+  const suffix = currency ? ` ${currency}` : "";
+  return `${amount}${suffix}`;
 }
 
 function formatDaysLeft(value) {
@@ -195,5 +226,6 @@ function formatService(service) {
   if (service === "porkbun") return "Porkbun";
   if (service === "proxyline") return "Proxyline";
   if (service === "darkshopping") return "Darkshopping";
+  if (service === "datalix") return "Datalix";
   return service;
 }

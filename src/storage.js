@@ -23,6 +23,16 @@ const DEFAULT_THRESHOLDS = {
     balanceThreshold: 2000,
     expiryThresholdDays: null,
   },
+  datalix: {
+    balanceThreshold: null,
+    expiryThresholdDays: 2,
+  },
+};
+
+const DEFAULT_CREDENTIALS = {
+  datalix: {
+    baseUrl: "https://backend.datalix.de/v1",
+  },
 };
 
 export class Storage {
@@ -166,6 +176,15 @@ function applyAccountDefaults(account) {
     expiryThresholdDays: null,
   };
   let changed = false;
+  const credentialDefaults = DEFAULT_CREDENTIALS[account.service] ?? {};
+
+  account.credentials ??= {};
+  for (const [key, value] of Object.entries(credentialDefaults)) {
+    if (!account.credentials[key]) {
+      account.credentials[key] = value;
+      changed = true;
+    }
+  }
 
   if (account.balanceThreshold === undefined || account.balanceThreshold === null) {
     if (account.balanceThreshold !== defaults.balanceThreshold) {

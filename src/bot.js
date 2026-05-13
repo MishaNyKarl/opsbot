@@ -5,6 +5,7 @@ const SERVICE_NAMES = {
   porkbun: "Porkbun",
   proxyline: "Proxyline",
   darkshopping: "Darkshopping",
+  datalix: "Datalix",
 };
 
 export class Bot {
@@ -306,6 +307,7 @@ export class Bot {
         [{ text: "Proxyline", callback_data: `service:${buyerId}:proxyline` }],
         [{ text: "Porkbun", callback_data: `service:${buyerId}:porkbun` }],
         [{ text: "Darkshopping", callback_data: `service:${buyerId}:darkshopping` }],
+        [{ text: "Datalix", callback_data: `service:${buyerId}:datalix` }],
         [{ text: "Назад", callback_data: `buyer:${buyerId}` }],
       ]),
     );
@@ -313,7 +315,7 @@ export class Bot {
 
   async askAccountData(chatId, buyerId, service) {
     this.pendingInputs.set(String(chatId), { type: "add_account", buyerId, service });
-    const example = service === "porkbun" ? "Название API_KEY SECRET_KEY" : "Название API_KEY";
+    const example = getAccountInputExample(service);
 
     return this.sendText(
       chatId,
@@ -375,7 +377,9 @@ export class Bot {
 
     const buttons = [[{ text: "Проверить сейчас", callback_data: `check_account:${account.id}` }]];
     if (isOwner) {
-      buttons.push([{ text: "Настроить баланс", callback_data: `set_balance:${account.id}` }]);
+      if (account.balanceThreshold !== null) {
+        buttons.push([{ text: "Настроить баланс", callback_data: `set_balance:${account.id}` }]);
+      }
       buttons.push([{ text: "Настроить срок", callback_data: `set_expiry:${account.id}` }]);
     }
     if (isAdmin) {
@@ -431,7 +435,11 @@ export class Bot {
         buyerTelegramId: pending.buyerId,
         service: pending.service,
         name,
-        credentials: { apiKey, secretApiKey: secretApiKey ?? "" },
+        credentials: {
+          apiKey,
+          secretApiKey: pending.service === "porkbun" ? secretApiKey : "",
+          baseUrl: pending.service === "datalix" ? "https://backend.datalix.de/v1" : "",
+        },
       });
 
       return this.sendText(
@@ -581,6 +589,11 @@ function checkResultKeyboard({ accountId, showExpired, expiredCount }) {
 
 function accountLabel(account) {
   return `${SERVICE_NAMES[account.service] ?? account.service}: ${account.name}`;
+}
+
+function getAccountInputExample(service) {
+  if (service === "porkbun") return "Название API_KEY SECRET_KEY";
+  return "Название API_KEY";
 }
 
 function formatUserShort(user) {
