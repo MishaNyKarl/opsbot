@@ -70,8 +70,11 @@ jobs:
             fi
             cd app
             if docker compose version >/dev/null 2>&1; then
+              docker compose down --remove-orphans || true
               docker compose up -d --build
             elif command -v docker-compose >/dev/null 2>&1; then
+              docker-compose down --remove-orphans || true
+              docker rm -f opsbot >/dev/null 2>&1 || true
               docker-compose up -d --build
             else
               echo 'Docker Compose is not installed. Install docker-compose-plugin on the server.' >&2
