@@ -73,6 +73,7 @@ export class Bot {
       if (data === "menu") return this.showMainMenu(chatId, userId);
       if (data === "help") return this.showHelp(chatId, userId);
       if (data === "servers") return this.showServers(chatId, userId);
+      if (data === "check_servers") return this.checkVisibleServersNow(chatId, userId);
       if (data === "add_server") return this.adminOnly(chatId, userId, () => this.askServerData(chatId));
       if (data.startsWith("server:")) {
         return this.showServerCard(chatId, userId, data.slice("server:".length));
@@ -380,6 +381,9 @@ export class Bot {
       },
     ]);
 
+    if (servers.length) {
+      rows.push([{ text: "Проверить все серверы", callback_data: "check_servers" }]);
+    }
     if (user.role === "admin") {
       rows.push([{ text: "Добавить сервер", callback_data: "add_server" }]);
     }
@@ -498,6 +502,46 @@ export class Bot {
         .filter(Boolean)
         .join("\n"),
       keyboard([[{ text: "К серверу", callback_data: `server:${server.id}` }]]),
+    );
+  }
+
+  async checkVisibleServersNow(chatId, userId) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    const servers = this.storage.listServers().filter((server) => {
+      if (user.role === "admin") return true;
+      return (server.subscribers ?? []).includes(String(userId));
+    });
+
+    if (!servers.length) {
+      return this.sendText(
+        chatId,
+        user.role === "admin"
+          ? "Серверов пока нет."
+          : "У вас нет серверов в подписке. Откройте сервер и нажмите «Подписаться на алерты».",
+        keyboard([[{ text: "К серверам", callback_data: "servers" }]]),
+      );
+    }
+
+    await this.sendText(chatId, "Пингую серверы...");
+    const results = [];
+    for (const server of servers) {
+      results.push(await this.serverMonitor.checkServer(server));
+    }
+
+    return this.sendText(
+      chatId,
+      [
+        "Результат проверки серверов:",
+        "",
+        ...results.map((result, index) => {
+          const status = result.status === "up" ? "доступен" : "недоступен";
+          const error = result.error ? `\n   ${result.error}` : "";
+          return `${index + 1}. ${result.server.name} (${result.server.host}) — ${status}${error}`;
+        }),
+      ].join("\n"),
+      keyboard([[{ text: "К серверам", callback_data: "servers" }]]),
     );
   }
 
