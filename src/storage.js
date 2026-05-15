@@ -4,6 +4,7 @@ import path from "node:path";
 const DEFAULT_DATA = {
   users: [],
   accounts: [],
+  servers: [],
   sentAlerts: [],
   meta: {
     version: 1,
@@ -157,6 +158,75 @@ export class Storage {
     Object.assign(account, patch, { updatedAt: new Date().toISOString() });
     await this.save();
     return account;
+  }
+
+  listServers({ serverId } = {}) {
+    return this.data.servers.filter((server) => {
+      if (serverId && server.id !== serverId) return false;
+      return !server.deletedAt;
+    });
+  }
+
+  getServer(serverId) {
+    return this.listServers({ serverId })[0];
+  }
+
+  async addServer(input) {
+    const now = new Date().toISOString();
+    const server = {
+      id: `srv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      name: input.name,
+      host: input.host,
+      enabled: true,
+      subscribers: [],
+      lastStatus: null,
+      lastCheckedAt: null,
+      lastError: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    this.data.servers.push(server);
+    await this.save();
+    return server;
+  }
+
+  async removeServer(serverId) {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Server ${serverId} not found`);
+    server.deletedAt = new Date().toISOString();
+    server.updatedAt = new Date().toISOString();
+    await this.save();
+    return server;
+  }
+
+  async updateServer(serverId, patch) {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Server ${serverId} not found`);
+    Object.assign(server, patch, { updatedAt: new Date().toISOString() });
+    await this.save();
+    return server;
+  }
+
+  async subscribeServer(serverId, telegramId) {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Server ${serverId} not found`);
+    server.subscribers ??= [];
+    const id = String(telegramId);
+    if (!server.subscribers.includes(id)) server.subscribers.push(id);
+    server.updatedAt = new Date().toISOString();
+    await this.save();
+    return server;
+  }
+
+  async unsubscribeServer(serverId, telegramId) {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Server ${serverId} not found`);
+    const id = String(telegramId);
+    server.subscribers = (server.subscribers ?? []).filter((subscriber) => subscriber !== id);
+    server.updatedAt = new Date().toISOString();
+    await this.save();
+    return server;
   }
 
   hasSentAlert(key) {

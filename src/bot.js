@@ -9,10 +9,11 @@ const SERVICE_NAMES = {
 };
 
 export class Bot {
-  constructor({ storage, telegram, monitor, bootstrapAdminIds }) {
+  constructor({ storage, telegram, monitor, serverMonitor, bootstrapAdminIds }) {
     this.storage = storage;
     this.telegram = telegram;
     this.monitor = monitor;
+    this.serverMonitor = serverMonitor;
     this.bootstrapAdminIds = bootstrapAdminIds;
     this.offset = 0;
     this.pendingInputs = new Map();
@@ -71,6 +72,26 @@ export class Bot {
     try {
       if (data === "menu") return this.showMainMenu(chatId, userId);
       if (data === "help") return this.showHelp(chatId, userId);
+      if (data === "servers") return this.showServers(chatId, userId);
+      if (data === "add_server") return this.adminOnly(chatId, userId, () => this.askServerData(chatId));
+      if (data.startsWith("server:")) {
+        return this.showServerCard(chatId, userId, data.slice("server:".length));
+      }
+      if (data.startsWith("check_server:")) {
+        return this.checkServerNow(chatId, userId, data.slice("check_server:".length));
+      }
+      if (data.startsWith("subscribe_server:")) {
+        return this.subscribeServer(chatId, userId, data.slice("subscribe_server:".length));
+      }
+      if (data.startsWith("unsubscribe_server:")) {
+        return this.unsubscribeServer(chatId, userId, data.slice("unsubscribe_server:".length));
+      }
+      if (data.startsWith("remove_server:")) {
+        return this.adminOnly(chatId, userId, () => this.confirmRemoveServer(chatId, data.slice("remove_server:".length)));
+      }
+      if (data.startsWith("confirm_remove_server:")) {
+        return this.adminOnly(chatId, userId, () => this.removeServer(chatId, data.slice("confirm_remove_server:".length)));
+      }
       if (data === "my_accounts") return this.showBuyerAccounts(chatId, userId);
       if (data === "check_my") return this.runManualCheck(chatId, userId);
       if (data === "expired_my") return this.runManualCheck(chatId, userId, null, { showExpired: true });
@@ -163,6 +184,7 @@ export class Bot {
         keyboard([
           [{ text: "Админка", callback_data: "admin" }],
           [{ text: "Мои аккаунты", callback_data: "my_accounts" }],
+          [{ text: "Серверы", callback_data: "servers" }],
           [{ text: "Проверить сейчас", callback_data: "check_my" }],
           [{ text: "Помощь", callback_data: "help" }],
         ]),
@@ -186,6 +208,7 @@ export class Bot {
       "Главное меню баера.",
       keyboard([
         [{ text: "Мои аккаунты", callback_data: "my_accounts" }],
+        [{ text: "Серверы", callback_data: "servers" }],
         [{ text: "Проверить сейчас", callback_data: "check_my" }],
         [{ text: "Помощь", callback_data: "help" }],
       ]),
@@ -218,6 +241,7 @@ export class Bot {
         [{ text: `Заявки на доступ (${pendingCount})`, callback_data: "pending_users" }],
         [{ text: "Баеры", callback_data: "buyers" }],
         [{ text: "Все аккаунты", callback_data: "all_accounts" }],
+        [{ text: "Серверы", callback_data: "servers" }],
         [{ text: "Назад", callback_data: "menu" }],
       ]),
     );
@@ -344,6 +368,144 @@ export class Bot {
     );
   }
 
+  async showServers(chatId, userId) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    const servers = this.storage.listServers();
+    const rows = servers.map((server) => [
+      {
+        text: `${serverStatusIcon(server)} ${server.name} (${server.host})`,
+        callback_data: `server:${server.id}`,
+      },
+    ]);
+
+    if (user.role === "admin") {
+      rows.push([{ text: "Добавить сервер", callback_data: "add_server" }]);
+    }
+    rows.push([{ text: "Назад", callback_data: "menu" }]);
+
+    return this.sendText(
+      chatId,
+      servers.length
+        ? "Серверы для ping-мониторинга:"
+        : "Серверов пока нет. Админ может добавить первый сервер.",
+      keyboard(rows),
+    );
+  }
+
+  async showServerCard(chatId, userId, serverId) {
+    const user = this.storage.getUser(userId);
+    const server = this.storage.getServer(serverId);
+    if (!server) throw new Error("Сервер не найден.");
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    const isAdmin = user.role === "admin";
+    const isSubscribed = (server.subscribers ?? []).includes(String(userId));
+    const rows = [[{ text: "Проверить сейчас", callback_data: `check_server:${server.id}` }]];
+    if (isSubscribed) {
+      rows.push([{ text: "Отписаться от алертов", callback_data: `unsubscribe_server:${server.id}` }]);
+    } else {
+      rows.push([{ text: "Подписаться на алерты", callback_data: `subscribe_server:${server.id}` }]);
+    }
+    if (isAdmin) {
+      rows.push([{ text: "Удалить сервер", callback_data: `remove_server:${server.id}` }]);
+    }
+    rows.push([{ text: "Назад", callback_data: "servers" }]);
+
+    return this.sendText(
+      chatId,
+      [
+        `Сервер: ${server.name}`,
+        `Host: ${server.host}`,
+        `Статус: ${formatServerStatus(server)}`,
+        `Подписчиков: ${(server.subscribers ?? []).length}`,
+        server.lastCheckedAt ? `Последняя проверка: ${formatDateTime(server.lastCheckedAt)}` : "Еще не проверялся",
+        server.lastError ? `Последняя ошибка: ${server.lastError}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      keyboard(rows),
+    );
+  }
+
+  async askServerData(chatId) {
+    this.pendingInputs.set(String(chatId), { type: "add_server" });
+    return this.sendText(
+      chatId,
+      [
+        "Отправьте сервер одним сообщением:",
+        "Название IP_или_HOST",
+        "",
+        "Например:",
+        "proxy-1 192.0.2.10",
+      ].join("\n"),
+      keyboard([[{ text: "Отмена", callback_data: "servers" }]]),
+    );
+  }
+
+  async subscribeServer(chatId, userId, serverId) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+    await this.storage.subscribeServer(serverId, userId);
+    return this.sendText(
+      chatId,
+      "Подписка включена. Если сервер упадет или восстановится, вы получите уведомление.",
+      keyboard([[{ text: "К серверу", callback_data: `server:${serverId}` }]]),
+    );
+  }
+
+  async unsubscribeServer(chatId, userId, serverId) {
+    const user = this.storage.getUser(userId);
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+    await this.storage.unsubscribeServer(serverId, userId);
+    return this.sendText(
+      chatId,
+      "Подписка отключена.",
+      keyboard([[{ text: "К серверу", callback_data: `server:${serverId}` }]]),
+    );
+  }
+
+  async confirmRemoveServer(chatId, serverId) {
+    const server = this.storage.getServer(serverId);
+    if (!server) throw new Error("Сервер не найден.");
+    return this.sendText(
+      chatId,
+      `Удалить сервер?\n${server.name}\n${server.host}`,
+      keyboard([
+        [{ text: "Да, удалить", callback_data: `confirm_remove_server:${server.id}` }],
+        [{ text: "Отмена", callback_data: `server:${server.id}` }],
+      ]),
+    );
+  }
+
+  async checkServerNow(chatId, userId, serverId) {
+    const user = this.storage.getUser(userId);
+    const server = this.storage.getServer(serverId);
+    if (!server) throw new Error("Сервер не найден.");
+    if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
+
+    await this.sendText(chatId, "Пингую сервер...");
+    const result = await this.serverMonitor.checkServer(server);
+    return this.sendText(
+      chatId,
+      [
+        `Сервер: ${server.name}`,
+        `Host: ${server.host}`,
+        `Статус: ${result.status === "up" ? "доступен" : "недоступен"}`,
+        result.error ? `Ошибка: ${result.error}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      keyboard([[{ text: "К серверу", callback_data: `server:${server.id}` }]]),
+    );
+  }
+
+  async removeServer(chatId, serverId) {
+    const server = await this.storage.removeServer(serverId);
+    return this.sendText(chatId, `Сервер удален: ${server.name}`, keyboard([[{ text: "К серверам", callback_data: "servers" }]]));
+  }
+
   async showBuyerAccounts(chatId, userId) {
     const user = this.storage.getUser(userId);
     if (user.status !== "active") return this.sendText(chatId, "Доступ еще не подтвержден.", mainMenuKeyboard());
@@ -423,6 +585,21 @@ export class Bot {
   async handlePendingInput(message, pending, text) {
     const chatId = String(message.chat.id);
     this.pendingInputs.delete(chatId);
+
+    if (pending.type === "add_server") {
+      const [name, host] = text.split(/\s+/);
+      if (!name || !host) {
+        await this.sendText(chatId, "Не хватает данных. Нужно: Название IP_или_HOST", keyboard([[{ text: "К серверам", callback_data: "servers" }]]));
+        return this.askServerData(chatId);
+      }
+
+      const server = await this.storage.addServer({ name, host });
+      return this.sendText(
+        chatId,
+        `Сервер добавлен.\n${server.name}\n${server.host}`,
+        keyboard([[{ text: "Открыть сервер", callback_data: `server:${server.id}` }]]),
+      );
+    }
 
     if (pending.type === "add_account") {
       const [name, apiKey, secretApiKey] = text.split(/\s+/);
@@ -594,6 +771,26 @@ function accountLabel(account) {
 function getAccountInputExample(service) {
   if (service === "porkbun") return "Название API_KEY SECRET_KEY";
   return "Название API_KEY";
+}
+
+function serverStatusIcon(server) {
+  if (server.lastStatus === "up") return "OK";
+  if (server.lastStatus === "down") return "DOWN";
+  return "NEW";
+}
+
+function formatServerStatus(server) {
+  if (server.lastStatus === "up") return "доступен";
+  if (server.lastStatus === "down") return "недоступен";
+  return "неизвестен";
+}
+
+function formatDateTime(value) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "Europe/Moscow",
+  }).format(new Date(value));
 }
 
 function formatUserShort(user) {

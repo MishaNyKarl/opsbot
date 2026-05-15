@@ -5,6 +5,8 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV DATA_FILE=/data/opsbot.json
 
+RUN apk add --no-cache iputils
+
 COPY package.json ./
 COPY src ./src
 

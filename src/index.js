@@ -1,6 +1,7 @@
 import { Bot } from "./bot.js";
 import { getConfig } from "./config.js";
 import { Monitor } from "./monitor.js";
+import { ServerMonitor, SERVER_PING_INTERVAL_MS } from "./serverMonitor.js";
 import { Storage } from "./storage.js";
 import { TelegramClient } from "./telegram.js";
 
@@ -19,10 +20,12 @@ for (const telegramId of config.adminIds) {
 
 const telegram = new TelegramClient(config.telegramToken);
 const monitor = new Monitor({ storage, telegram });
+const serverMonitor = new ServerMonitor({ storage, telegram });
 const bot = new Bot({
   storage,
   telegram,
   monitor,
+  serverMonitor,
   bootstrapAdminIds: config.adminIds,
 });
 
@@ -32,5 +35,11 @@ setInterval(() => {
 
 monitor.checkAll().catch((error) => console.error("Initial monitor error:", error));
 
-console.log(`Opsbot запущен. Интервал проверки: ${Math.round(config.checkIntervalMs / 3600000)} ч.`);
+setInterval(() => {
+  serverMonitor.checkAll().catch((error) => console.error("Scheduled server ping error:", error));
+}, SERVER_PING_INTERVAL_MS);
+
+serverMonitor.checkAll().catch((error) => console.error("Initial server ping error:", error));
+
+console.log(`Opsbot запущен. Интервал проверки сервисов: ${Math.round(config.checkIntervalMs / 60000)} мин. Интервал ping: ${Math.round(SERVER_PING_INTERVAL_MS / 60000)} мин.`);
 await bot.startPolling();
