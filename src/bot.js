@@ -496,7 +496,7 @@ export class Bot {
       [
         `Сервер: ${server.name}`,
         `Host: ${server.host}`,
-        `Статус: ${result.status === "up" ? "доступен" : "недоступен"}`,
+        `Статус: ${formatPingResultStatus(result.status)}`,
         result.error ? `Ошибка: ${result.error}` : null,
       ]
         .filter(Boolean)
@@ -536,7 +536,7 @@ export class Bot {
         "Результат проверки серверов:",
         "",
         ...results.map((result, index) => {
-          const status = result.status === "up" ? "доступен" : "недоступен";
+          const status = formatPingResultStatus(result.status);
           const error = result.error ? `\n   ${result.error}` : "";
           return `${index + 1}. ${result.server.name} (${result.server.host}) — ${status}${error}`;
         }),
@@ -820,13 +820,22 @@ function getAccountInputExample(service) {
 function serverStatusIcon(server) {
   if (server.lastStatus === "up") return "OK";
   if (server.lastStatus === "down") return "DOWN";
+  if (server.confirmingOutage) return "CHECK";
   return "NEW";
 }
 
 function formatServerStatus(server) {
   if (server.lastStatus === "up") return "доступен";
   if (server.lastStatus === "down") return "недоступен";
+  if (server.confirmingOutage) return "перепроверяется";
   return "неизвестен";
+}
+
+function formatPingResultStatus(status) {
+  if (status === "up") return "доступен";
+  if (status === "down") return "недоступен";
+  if (status === "suspect") return "ошибка ping, идет перепроверка 10 минут";
+  return status;
 }
 
 function formatDateTime(value) {

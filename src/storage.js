@@ -56,6 +56,9 @@ export class Storage {
       for (const account of this.data.accounts) {
         changed = applyAccountDefaults(account) || changed;
       }
+      for (const server of this.data.servers) {
+        changed = applyServerDefaults(server) || changed;
+      }
       if (changed) await this.save();
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -182,6 +185,8 @@ export class Storage {
       lastStatus: null,
       lastCheckedAt: null,
       lastError: null,
+      outageCandidateSince: null,
+      confirmingOutage: false,
       createdAt: now,
       updatedAt: now,
     };
@@ -265,6 +270,23 @@ function applyAccountDefaults(account) {
   if (account.expiryThresholdDays === undefined || account.expiryThresholdDays === null) {
     if (account.expiryThresholdDays !== defaults.expiryThresholdDays) {
       account.expiryThresholdDays = defaults.expiryThresholdDays;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+function applyServerDefaults(server) {
+  let changed = false;
+  const defaults = {
+    outageCandidateSince: null,
+    confirmingOutage: false,
+  };
+
+  for (const [key, value] of Object.entries(defaults)) {
+    if (server[key] === undefined) {
+      server[key] = value;
       changed = true;
     }
   }

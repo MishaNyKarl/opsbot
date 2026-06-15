@@ -38,6 +38,13 @@ export class Monitor {
 
     try {
       const snapshot = await getServiceSnapshot(account);
+      if (account.consecutiveErrors) {
+        await this.storage.updateAccount(account.id, {
+          consecutiveErrors: 0,
+          lastErrorMessage: null,
+          lastErrorAt: null,
+        });
+      }
       report.snapshot = snapshot;
       report.ok = true;
 
@@ -109,7 +116,22 @@ export class Monitor {
       }
     } catch (error) {
       report.error = error;
-      await this.notifyAdmins(`Ошибка мониторинга ${account.service}/${account.name}: ${error.message}`);
+      const consecutiveErrors = Number(account.consecutiveErrors ?? 0) + 1;
+      await this.storage.updateAccount(account.id, {
+        consecutiveErrors,
+        lastErrorMessage: error.message,
+        lastErrorAt: new Date().toISOString(),
+      });
+
+      if (consecutiveErrors === 3) {
+        await this.notifyAdmins(
+          [
+            `Ошибка мониторинга ${account.service}/${account.name}`,
+            `Ошибка повторилась ${consecutiveErrors} раза подряд.`,
+            `Текст ошибки: ${error.message}`,
+          ].join("\n"),
+        );
+      }
     }
 
     return report;
