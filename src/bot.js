@@ -746,7 +746,11 @@ export class Bot {
     await this.sendText(chatId, options.showExpired ? "Собираю истекшие..." : "Проверяю...");
     const reports = [];
     for (const account of accounts) {
-      reports.push(...(await this.monitor.checkAll({ accountId: account.id, force: true })));
+      reports.push(...(await this.monitor.checkAll({
+        accountId: account.id,
+        force: true,
+        onProgress: (event) => this.sendManualCheckProgress(chatId, event),
+      })));
     }
 
     const expiredCount = reports.reduce((sum, report) => sum + getExpiredCount(report), 0);
@@ -776,6 +780,12 @@ export class Bot {
     } catch (error) {
       console.error(`Не удалось отправить сообщение ${chatId}:`, error.message);
     }
+  }
+
+  async sendManualCheckProgress(chatId, event) {
+    if (event.account?.service !== "virustotal_domains") return;
+    const text = formatManualCheckProgress(event);
+    if (text) await this.safeNotify(chatId, text);
   }
 
   async notifyAdminsAboutRequest(user) {
@@ -854,6 +864,27 @@ function buildAccountCredentials(service, apiKey, secretApiKey = "") {
     return { apiKey, opsvaultApiKey: secretApiKey };
   }
   return { apiKey, secretApiKey: "", baseUrl: "" };
+}
+
+function formatManualCheckProgress(event) {
+  const accountName = event.account?.name ?? "аккаунт";
+  if (event.type === "domains.load_started") {
+    return `${accountName}: загружаю домены из OpsVault.`;
+  }
+  if (event.type === "domains.accepted") {
+    if (event.total === 0) return `${accountName}: активных Porkbun-доменов для проверки нет.`;
+    return `${accountName}: принято на проверку ${event.total} доменов. Размер пачки: ${event.batchSize}, пачек: ${event.totalBatches}.`;
+  }
+  if (event.type === "batch.started") {
+    return `${accountName}: пачка ${event.batchNumber}/${event.totalBatches} принята на проверку (${event.size} дом.).`;
+  }
+  if (event.type === "batch.finished") {
+    return `${accountName}: пачка ${event.batchNumber}/${event.totalBatches} прошла.\nПроверено: ${event.checked}/${event.total}\nПроблем: ${event.problems}\nОшибок после ретраев: ${event.errors}`;
+  }
+  if (event.type === "batch.waiting") {
+    return `${accountName}: жду ${event.waitSeconds} сек. до следующей пачки, чтобы не превысить лимит VirusTotal.`;
+  }
+  return null;
 }
 
 function serverStatusIcon(server) {

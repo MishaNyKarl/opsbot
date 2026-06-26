@@ -1,12 +1,15 @@
 const OPSVAULT_BASE_URL = "https://portalwiki.world";
 const VIRUSTOTAL_BASE_URL = "https://www.virustotal.com/api/v3";
-const VIRUSTOTAL_REQUEST_DELAY_MS = 16000;
+const VIRUSTOTAL_BATCH_SIZE = 4;
+const VIRUSTOTAL_RATE_WINDOW_MS = 60 * 1000;
+const REQUEST_RETRIES = 3;
 
-export async function getVirustotalDomainsSnapshot(credentials) {
+export async function getVirustotalDomainsSnapshot(credentials, options = {}) {
   if (!credentials.apiKey || !credentials.opsvaultApiKey) {
     throw new Error("Для Virustotal доменов нужны VirusTotal API key и OpsVault API key.");
   }
 
+  await emitProgress(options, { type: "domains.load_started" });
   const domains = await readOpsvaultDomains(credentials.opsvaultApiKey);
   const porkbunDomains = domains
     .filter((domain) => String(domain.source ?? "").toLowerCase() === "porkbun")
@@ -17,18 +20,75 @@ export async function getVirustotalDomainsSnapshot(credentials) {
     }))
     .filter((domain) => domain.domain);
 
+  const totalBatches = Math.ceil(porkbunDomains.length / VIRUSTOTAL_BATCH_SIZE);
+  await emitProgress(options, {
+    type: "domains.accepted",
+    total: porkbunDomains.length,
+    batchSize: VIRUSTOTAL_BATCH_SIZE,
+    totalBatches,
+  });
+
   const domainAlerts = [];
   const checks = [];
+  const domainErrors = [];
 
-  for (let index = 0; index < porkbunDomains.length; index += 1) {
-    const domain = porkbunDomains[index];
-    const report = await readVirustotalDomain(credentials.apiKey, domain.domain);
-    checks.push({ domain: domain.domain, report });
+  for (let offset = 0; offset < porkbunDomains.length; offset += VIRUSTOTAL_BATCH_SIZE) {
+    const batchStartedAt = Date.now();
+    const batchNumber = Math.floor(offset / VIRUSTOTAL_BATCH_SIZE) + 1;
+    const batch = porkbunDomains.slice(offset, offset + VIRUSTOTAL_BATCH_SIZE);
 
-    const alert = buildDomainAlert(domain, report);
-    if (alert) domainAlerts.push(alert);
+    await emitProgress(options, {
+      type: "batch.started",
+      batchNumber,
+      totalBatches,
+      size: batch.length,
+    });
 
-    if (index < porkbunDomains.length - 1) await wait(VIRUSTOTAL_REQUEST_DELAY_MS);
+    for (const domain of batch) {
+      try {
+        const report = await readVirustotalDomain(credentials.apiKey, domain.domain);
+        checks.push({ domain: domain.domain, report });
+
+        const alert = buildDomainAlert(domain, report);
+        if (alert) domainAlerts.push(alert);
+      } catch (error) {
+        if (!error.retryable) throw error;
+        domainErrors.push({
+          domain: domain.domain,
+          error: error.message,
+        });
+        checks.push({
+          domain: domain.domain,
+          error: error.message,
+        });
+      }
+    }
+
+    const checked = checks.length;
+    const errors = domainErrors.length;
+    const problems = domainAlerts.length;
+    await emitProgress(options, {
+      type: "batch.finished",
+      batchNumber,
+      totalBatches,
+      checked,
+      total: porkbunDomains.length,
+      errors,
+      problems,
+    });
+
+    const isLastBatch = offset + VIRUSTOTAL_BATCH_SIZE >= porkbunDomains.length;
+    const elapsed = Date.now() - batchStartedAt;
+    const waitMs = VIRUSTOTAL_RATE_WINDOW_MS - elapsed;
+    if (!isLastBatch && waitMs > 0) {
+      await emitProgress(options, {
+        type: "batch.waiting",
+        batchNumber,
+        totalBatches,
+        waitSeconds: Math.ceil(waitMs / 1000),
+      });
+      await wait(waitMs);
+    }
   }
 
   return {
@@ -42,6 +102,7 @@ export async function getVirustotalDomainsSnapshot(credentials) {
     statuses: [],
     domainAlerts,
     domainsChecked: checks.length,
+    domainErrors,
     raw: {
       domains: porkbunDomains,
       checks,
@@ -92,22 +153,45 @@ async function readVirustotalDomain(apiKey, domain) {
 }
 
 async function fetchJson(url, { headers, serviceName, allowNotFound = false }) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      ...headers,
-    },
-    signal: AbortSignal.timeout(30000),
-  });
+  let lastError = null;
 
-  const data = await response.json().catch(() => ({}));
-  if (allowNotFound && response.status === 404) return { notFound: true, raw: data };
-  if (!response.ok) {
-    const message = data.error?.message || data.detail || data.message || `HTTP ${response.status}`;
-    throw new Error(`${serviceName}: ${message}`);
+  for (let attempt = 1; attempt <= REQUEST_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          ...headers,
+        },
+        signal: AbortSignal.timeout(45000),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (allowNotFound && response.status === 404) return { notFound: true, raw: data };
+      if (!response.ok) {
+        const message = data.error?.message || data.detail || data.message || `HTTP ${response.status}`;
+        const error = new Error(`${serviceName}: ${message}`);
+        error.retryable = response.status === 429 || response.status >= 500;
+        if (!error.retryable) throw error;
+        lastError = error;
+      } else {
+        return data;
+      }
+    } catch (error) {
+      if (error.name === "AbortError" || error.name === "TimeoutError" || error.message === "fetch failed") {
+        error.retryable = true;
+      }
+      if (!error.retryable) throw error;
+      lastError = error;
+    }
+
+    if (attempt < REQUEST_RETRIES) {
+      await wait(attempt * 5000);
+    }
   }
 
-  return data;
+  lastError ??= new Error(`${serviceName}: fetch failed`);
+  lastError.retryable = true;
+  throw lastError;
 }
 
 function buildDomainAlert(domain, report) {
@@ -163,4 +247,28 @@ function normalizeDomain(value) {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function emitProgress(options, event) {
+  console.log(formatProgressForLog(event));
+  if (typeof options.onProgress === "function") {
+    await options.onProgress(event);
+  }
+}
+
+function formatProgressForLog(event) {
+  if (event.type === "domains.load_started") return "Virustotal домены: загружаю домены из OpsVault";
+  if (event.type === "domains.accepted") {
+    return `Virustotal домены: принято ${event.total} доменов, пачек ${event.totalBatches}`;
+  }
+  if (event.type === "batch.started") {
+    return `Virustotal домены: пачка ${event.batchNumber}/${event.totalBatches} принята на проверку (${event.size} дом.)`;
+  }
+  if (event.type === "batch.finished") {
+    return `Virustotal домены: пачка ${event.batchNumber}/${event.totalBatches} готова, проверено ${event.checked}/${event.total}, проблем ${event.problems}, ошибок ${event.errors}`;
+  }
+  if (event.type === "batch.waiting") {
+    return `Virustotal домены: жду ${event.waitSeconds} сек. до следующей пачки`;
+  }
+  return `Virustotal домены: ${event.type}`;
 }

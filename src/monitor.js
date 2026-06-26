@@ -10,7 +10,7 @@ export class Monitor {
     this.running = false;
   }
 
-  async checkAll({ accountId, force = false } = {}) {
+  async checkAll({ accountId, force = false, onProgress = null } = {}) {
     if (this.running) return [];
     this.running = true;
 
@@ -18,7 +18,7 @@ export class Monitor {
     try {
       const accounts = this.storage.listAccounts({ accountId });
       for (const account of accounts) {
-        reports.push(await this.checkAccount(account, { force }));
+        reports.push(await this.checkAccount(account, { force, onProgress }));
       }
     } finally {
       this.running = false;
@@ -43,7 +43,12 @@ export class Monitor {
         return report;
       }
 
-      const snapshot = await getServiceSnapshot(account);
+      console.log(`Проверка аккаунта ${account.service}/${account.name} началась`);
+      const snapshot = await getServiceSnapshot(account, {
+        onProgress: options.onProgress
+          ? (event) => options.onProgress({ ...event, account })
+          : null,
+      });
       if (account.consecutiveErrors) {
         await this.storage.updateAccount(account.id, {
           consecutiveErrors: 0,
@@ -53,6 +58,7 @@ export class Monitor {
       }
       report.snapshot = snapshot;
       report.ok = true;
+      console.log(`Проверка аккаунта ${account.service}/${account.name} завершена`);
 
       if (account.balanceThreshold !== null && snapshot.balance.amount <= account.balanceThreshold) {
         const key = [
@@ -148,6 +154,7 @@ export class Monitor {
         });
       }
     } catch (error) {
+      console.error(`Ошибка проверки аккаунта ${account.service}/${account.name}:`, error.message);
       report.error = error;
       const consecutiveErrors = Number(account.consecutiveErrors ?? 0) + 1;
       await this.storage.updateAccount(account.id, {
@@ -212,6 +219,9 @@ export function formatCheckReport(report, options = {}) {
     .map((status, index) => `${index + 1}. ${status.label} — ${status.statusLabel ?? status.status}`);
   const domainAlerts = (report.snapshot.domainAlerts ?? [])
     .map((domain, index) => `${index + 1}. ${domain.label} — malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, reputation ${domain.reputation}`);
+  const domainErrors = (report.snapshot.domainErrors ?? [])
+    .slice(0, 8)
+    .map((domain, index) => `${index + 1}. ${domain.domain}: ${domain.error}`);
   const domainCheckSummary = report.account.service === "virustotal_domains"
     ? `Проверено доменов: ${report.snapshot.domainsChecked ?? 0}`
     : null;
@@ -226,6 +236,7 @@ export function formatCheckReport(report, options = {}) {
     `Баланс: ${balance}`,
     domainCheckSummary,
     domainAlerts.length ? `Проблемные домены:\n${domainAlerts.join("\n")}` : null,
+    domainErrors.length ? `Ошибки проверки доменов:\n${domainErrors.join("\n")}` : null,
     statusErrors.length ? `Ошибки статуса:\n${statusErrors.join("\n")}` : null,
     "",
     expiring.length ? `${title}:\n${expiring.join("\n")}` : emptyText,
@@ -276,6 +287,7 @@ function emptyDomainSnapshot(account) {
     statuses: [],
     domainAlerts: [],
     domainsChecked: account.lastDomainSecurityCheckCount ?? 0,
+    domainErrors: [],
     skipped: true,
   };
 }
