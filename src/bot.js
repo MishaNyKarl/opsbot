@@ -6,6 +6,7 @@ const SERVICE_NAMES = {
   proxyline: "Proxyline",
   darkshopping: "Darkshopping",
   datalix: "Datalix",
+  virustotal_domains: "Virustotal домены",
 };
 
 export class Bot {
@@ -149,13 +150,14 @@ export class Bot {
     const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
 
     if (!existing) {
-      await this.storage.upsertUser({
+      const user = await this.storage.upsertUser({
         telegramId,
         username: message.from.username ?? "",
         name,
         role: isBootstrapAdmin ? "admin" : "buyer",
         status: isBootstrapAdmin ? "active" : "pending",
       });
+      if (!isBootstrapAdmin) await this.notifyAdminsAboutRequest(user);
       return;
     }
 
@@ -333,6 +335,7 @@ export class Bot {
         [{ text: "Porkbun", callback_data: `service:${buyerId}:porkbun` }],
         [{ text: "Darkshopping", callback_data: `service:${buyerId}:darkshopping` }],
         [{ text: "Datalix", callback_data: `service:${buyerId}:datalix` }],
+        [{ text: "Virustotal домены", callback_data: `service:${buyerId}:virustotal_domains` }],
         [{ text: "Назад", callback_data: `buyer:${buyerId}` }],
       ]),
     );
@@ -586,7 +589,9 @@ export class Bot {
       if (account.balanceThreshold !== null) {
         buttons.push([{ text: "Настроить баланс", callback_data: `set_balance:${account.id}` }]);
       }
-      buttons.push([{ text: "Настроить срок", callback_data: `set_expiry:${account.id}` }]);
+      if (account.service !== "virustotal_domains") {
+        buttons.push([{ text: "Настроить срок", callback_data: `set_expiry:${account.id}` }]);
+      }
     }
     if (isAdmin) {
       buttons.push([{ text: "Удалить аккаунт", callback_data: `remove_account:${account.id}` }]);
@@ -599,9 +604,13 @@ export class Bot {
         accountLabel(account),
         `ID: ${account.id}`,
         `Баер: ${account.buyerTelegramId}`,
-        `Порог баланса: ${account.balanceThreshold ?? "не задан"}`,
-        `Уведомлять за: ${account.expiryThresholdDays ?? "не задано"} дн.`,
-      ].join("\n"),
+        account.service === "virustotal_domains"
+          ? `Проверка: раз в день, вручную — по кнопке`
+          : `Порог баланса: ${account.balanceThreshold ?? "не задан"}`,
+        account.service === "virustotal_domains"
+          ? null
+          : `Уведомлять за: ${account.expiryThresholdDays ?? "не задано"} дн.`,
+      ].filter(Boolean).join("\n"),
       keyboard(buttons),
     );
   }
@@ -647,7 +656,7 @@ export class Bot {
 
     if (pending.type === "add_account") {
       const [name, apiKey, secretApiKey] = text.split(/\s+/);
-      if (!name || !apiKey || (pending.service === "porkbun" && !secretApiKey)) {
+      if (!name || !apiKey || (requiresSecondApiKey(pending.service) && !secretApiKey)) {
         await this.sendText(chatId, "Не хватает данных. Попробуйте еще раз.", adminBackKeyboard());
         return this.askAccountData(chatId, pending.buyerId, pending.service);
       }
@@ -656,11 +665,7 @@ export class Bot {
         buyerTelegramId: pending.buyerId,
         service: pending.service,
         name,
-        credentials: {
-          apiKey,
-          secretApiKey: pending.service === "porkbun" ? secretApiKey : "",
-          baseUrl: pending.service === "datalix" ? "https://backend.datalix.de/v1" : "",
-        },
+        credentials: buildAccountCredentials(pending.service, apiKey, secretApiKey),
       });
 
       return this.sendText(
@@ -741,7 +746,7 @@ export class Bot {
     await this.sendText(chatId, options.showExpired ? "Собираю истекшие..." : "Проверяю...");
     const reports = [];
     for (const account of accounts) {
-      reports.push(...(await this.monitor.checkAll({ accountId: account.id })));
+      reports.push(...(await this.monitor.checkAll({ accountId: account.id, force: true })));
     }
 
     const expiredCount = reports.reduce((sum, report) => sum + getExpiredCount(report), 0);
@@ -771,6 +776,22 @@ export class Bot {
     } catch (error) {
       console.error(`Не удалось отправить сообщение ${chatId}:`, error.message);
     }
+  }
+
+  async notifyAdminsAboutRequest(user) {
+    const admins = this.storage
+      .listUsers()
+      .filter((admin) => admin.role === "admin" && admin.status === "active");
+    const text = [
+      "Новая заявка на доступ",
+      `Пользователь: ${formatUserShort(user)}`,
+      `Telegram ID: ${user.telegramId}`,
+    ].join("\n");
+    const markup = keyboard([
+      [{ text: "Подтвердить", callback_data: `approve:${user.telegramId}` }],
+      [{ text: "Все заявки", callback_data: "pending_users" }],
+    ]);
+    await Promise.all(admins.map((admin) => this.safeNotify(admin.telegramId, text, markup)));
   }
 }
 
@@ -814,7 +835,25 @@ function accountLabel(account) {
 
 function getAccountInputExample(service) {
   if (service === "porkbun") return "Название API_KEY SECRET_KEY";
+  if (service === "virustotal_domains") return "Название VIRUSTOTAL_API_KEY OPSVAULT_API_KEY";
   return "Название API_KEY";
+}
+
+function requiresSecondApiKey(service) {
+  return service === "porkbun" || service === "virustotal_domains";
+}
+
+function buildAccountCredentials(service, apiKey, secretApiKey = "") {
+  if (service === "porkbun") {
+    return { apiKey, secretApiKey };
+  }
+  if (service === "datalix") {
+    return { apiKey, baseUrl: "https://backend.datalix.de/v1" };
+  }
+  if (service === "virustotal_domains") {
+    return { apiKey, opsvaultApiKey: secretApiKey };
+  }
+  return { apiKey, secretApiKey: "", baseUrl: "" };
 }
 
 function serverStatusIcon(server) {

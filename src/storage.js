@@ -28,6 +28,10 @@ const DEFAULT_THRESHOLDS = {
     balanceThreshold: null,
     expiryThresholdDays: 2,
   },
+  virustotal_domains: {
+    balanceThreshold: null,
+    expiryThresholdDays: null,
+  },
 };
 
 const DEFAULT_CREDENTIALS = {

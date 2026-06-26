@@ -10,7 +10,7 @@ export class Monitor {
     this.running = false;
   }
 
-  async checkAll({ accountId } = {}) {
+  async checkAll({ accountId, force = false } = {}) {
     if (this.running) return [];
     this.running = true;
 
@@ -18,7 +18,7 @@ export class Monitor {
     try {
       const accounts = this.storage.listAccounts({ accountId });
       for (const account of accounts) {
-        reports.push(await this.checkAccount(account));
+        reports.push(await this.checkAccount(account, { force }));
       }
     } finally {
       this.running = false;
@@ -27,7 +27,7 @@ export class Monitor {
     return reports;
   }
 
-  async checkAccount(account) {
+  async checkAccount(account, options = {}) {
     const report = {
       account,
       ok: false,
@@ -37,6 +37,12 @@ export class Monitor {
     };
 
     try {
+      if (account.service === "virustotal_domains" && !options.force && account.lastDomainSecurityCheckDate === todayKey()) {
+        report.snapshot = emptyDomainSnapshot(account);
+        report.ok = true;
+        return report;
+      }
+
       const snapshot = await getServiceSnapshot(account);
       if (account.consecutiveErrors) {
         await this.storage.updateAccount(account.id, {
@@ -114,6 +120,33 @@ export class Monitor {
         await this.storage.markAlertSent(key);
         report.alerts.push(message);
       }
+
+      for (const domain of snapshot.domainAlerts ?? []) {
+        const key = ["domain-security", account.id, domain.id, new Date().toISOString().slice(0, 10)].join(":");
+        if (this.storage.hasSentAlert(key)) continue;
+
+        const message = [
+          "Alert: проблема с доменом в VirusTotal",
+          `Сервис: ${account.service}`,
+          `Аккаунт: ${account.name}`,
+          `Домен: ${domain.label}`,
+          `Статистика: malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, harmless ${domain.stats.harmless}, undetected ${domain.stats.undetected}`,
+          `Репутация: ${domain.reputation}`,
+          domain.maliciousVotes ? `Жалобы пользователей VT: ${domain.maliciousVotes}` : null,
+          domain.detections?.length ? `Детекты: ${formatDetections(domain.detections)}` : null,
+        ].filter(Boolean).join("\n");
+        await this.notifyAccount(account, message);
+        await this.storage.markAlertSent(key);
+        report.alerts.push(message);
+      }
+
+      if (account.service === "virustotal_domains") {
+        await this.storage.updateAccount(account.id, {
+          lastDomainSecurityCheckDate: todayKey(),
+          lastDomainSecurityCheckAt: new Date().toISOString(),
+          lastDomainSecurityCheckCount: snapshot.domainsChecked ?? 0,
+        });
+      }
     } catch (error) {
       report.error = error;
       const consecutiveErrors = Number(account.consecutiveErrors ?? 0) + 1;
@@ -177,6 +210,11 @@ export function formatCheckReport(report, options = {}) {
   const statusErrors = (report.snapshot.statuses ?? [])
     .filter((status) => status.status === "error")
     .map((status, index) => `${index + 1}. ${status.label} — ${status.statusLabel ?? status.status}`);
+  const domainAlerts = (report.snapshot.domainAlerts ?? [])
+    .map((domain, index) => `${index + 1}. ${domain.label} — malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, reputation ${domain.reputation}`);
+  const domainCheckSummary = report.account.service === "virustotal_domains"
+    ? `Проверено доменов: ${report.snapshot.domainsChecked ?? 0}`
+    : null;
   const title = showExpired ? "Истекшие прокси, домены и серверы" : "Ближайшие окончания и оплаты";
   const emptyText = showExpired
     ? "Истекшие прокси, домены и серверы: нет"
@@ -186,6 +224,8 @@ export function formatCheckReport(report, options = {}) {
     `Аккаунт: ${report.account.name}`,
     `Сервис: ${formatService(report.account.service)}`,
     `Баланс: ${balance}`,
+    domainCheckSummary,
+    domainAlerts.length ? `Проблемные домены:\n${domainAlerts.join("\n")}` : null,
     statusErrors.length ? `Ошибки статуса:\n${statusErrors.join("\n")}` : null,
     "",
     expiring.length ? `${title}:\n${expiring.join("\n")}` : emptyText,
@@ -216,6 +256,37 @@ function formatBalance(balance) {
 function formatMoney(amount, currency = "") {
   const suffix = currency ? ` ${currency}` : "";
   return `${amount}${suffix}`;
+}
+
+function formatDetections(detections) {
+  return detections
+    .map((detection) => `${detection.engine}: ${detection.result ?? detection.category}`)
+    .join("; ");
+}
+
+function emptyDomainSnapshot(account) {
+  return {
+    balance: {
+      amount: Number.NaN,
+      currency: "",
+      display: "баланс не проверяется",
+      raw: null,
+    },
+    expirations: [],
+    statuses: [],
+    domainAlerts: [],
+    domainsChecked: account.lastDomainSecurityCheckCount ?? 0,
+    skipped: true,
+  };
+}
+
+function todayKey() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 function formatDaysLeft(value) {
@@ -249,5 +320,6 @@ function formatService(service) {
   if (service === "proxyline") return "Proxyline";
   if (service === "darkshopping") return "Darkshopping";
   if (service === "datalix") return "Datalix";
+  if (service === "virustotal_domains") return "Virustotal домены";
   return service;
 }
