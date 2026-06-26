@@ -103,6 +103,9 @@ export class Bot {
       if (data.startsWith("expired_account:")) {
         return this.runManualCheck(chatId, userId, data.slice("expired_account:".length), { showExpired: true });
       }
+      if (data.startsWith("domain_alerts:")) {
+        return this.showDomainAlerts(chatId, userId, data.slice("domain_alerts:".length));
+      }
 
       if (data === "admin") return this.adminOnly(chatId, userId, () => this.showAdminMenu(chatId));
       if (data === "pending_users") return this.adminOnly(chatId, userId, () => this.showPendingUsers(chatId));
@@ -754,11 +757,47 @@ export class Bot {
     }
 
     const expiredCount = reports.reduce((sum, report) => sum + getExpiredCount(report), 0);
+    const domainAlertAccount = reports.find((report) => (report.snapshot?.domainAlerts ?? []).length > 0)?.account;
     return this.sendText(
       chatId,
       reports.map((report) => formatCheckReport(report, { showExpired: options.showExpired })).join("\n\n"),
-      checkResultKeyboard({ accountId, showExpired: options.showExpired, expiredCount }),
+      checkResultKeyboard({
+        accountId,
+        showExpired: options.showExpired,
+        expiredCount,
+        domainAlertAccountId: domainAlertAccount?.id,
+        domainAlertCount: domainAlertAccount?.lastDomainSecurityAlerts?.length,
+      }),
     );
+  }
+
+  async showDomainAlerts(chatId, userId, accountId) {
+    const account = this.storage.getAccount(accountId);
+    if (!account) throw new Error("Аккаунт не найден.");
+
+    const user = this.storage.getUser(userId);
+    const isOwner = account.buyerTelegramId === String(userId);
+    const isAdmin = user?.role === "admin" && user.status === "active";
+    if (!isOwner && !isAdmin) return this.sendText(chatId, "Этот аккаунт вам не доступен.", mainMenuKeyboard());
+
+    const alerts = account.lastDomainSecurityAlerts ?? [];
+    if (!alerts.length) {
+      return this.sendText(
+        chatId,
+        "Актуальных проблемных доменов по последней проверке нет.",
+        keyboard([[{ text: "К аккаунту", callback_data: `account:${account.id}` }]]),
+      );
+    }
+
+    await this.sendText(
+      chatId,
+      `Проблемные домены по последней проверке: ${alerts.length}`,
+      keyboard([[{ text: "К аккаунту", callback_data: `account:${account.id}` }]]),
+    );
+
+    for (const domain of alerts) {
+      await this.safeNotify(chatId, formatDomainAlertDetails(account, domain));
+    }
   }
 
   async adminOnly(chatId, userId, action) {
@@ -817,8 +856,16 @@ function adminBackKeyboard() {
   return keyboard([[{ text: "Назад в админку", callback_data: "admin" }]]);
 }
 
-function checkResultKeyboard({ accountId, showExpired, expiredCount }) {
+function checkResultKeyboard({ accountId, showExpired, expiredCount, domainAlertAccountId = null, domainAlertCount = 0 }) {
   const rows = [];
+  if (domainAlertAccountId) {
+    rows.push([
+      {
+        text: `Посмотреть проблемные домены${domainAlertCount ? ` (${domainAlertCount})` : ""}`,
+        callback_data: `domain_alerts:${domainAlertAccountId}`,
+      },
+    ]);
+  }
   if (!showExpired && expiredCount > 0) {
     rows.push([
       {
@@ -885,6 +932,25 @@ function formatManualCheckProgress(event) {
     return `${accountName}: жду ${event.waitSeconds} сек. до следующей пачки, чтобы не превысить лимит VirusTotal.`;
   }
   return null;
+}
+
+function formatDomainAlertDetails(account, domain) {
+  return [
+    "Alert: проблема с доменом в VirusTotal",
+    `Сервис: ${SERVICE_NAMES[account.service] ?? account.service}`,
+    `Аккаунт: ${account.name}`,
+    `Домен: ${domain.label}`,
+    `Статистика: malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, harmless ${domain.stats.harmless}, undetected ${domain.stats.undetected}`,
+    `Репутация: ${domain.reputation}`,
+    domain.maliciousVotes ? `Жалобы пользователей VT: ${domain.maliciousVotes}` : null,
+    domain.detections?.length ? `Детекты: ${formatDetections(domain.detections)}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+function formatDetections(detections) {
+  return detections
+    .map((detection) => `${detection.engine}: ${detection.result ?? detection.category}`)
+    .join("; ");
 }
 
 function serverStatusIcon(server) {

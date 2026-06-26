@@ -127,31 +127,31 @@ export class Monitor {
         report.alerts.push(message);
       }
 
-      for (const domain of snapshot.domainAlerts ?? []) {
-        const key = ["domain-security", account.id, domain.id, new Date().toISOString().slice(0, 10)].join(":");
-        if (this.storage.hasSentAlert(key)) continue;
-
-        const message = [
-          "Alert: проблема с доменом в VirusTotal",
-          `Сервис: ${account.service}`,
-          `Аккаунт: ${account.name}`,
-          `Домен: ${domain.label}`,
-          `Статистика: malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, harmless ${domain.stats.harmless}, undetected ${domain.stats.undetected}`,
-          `Репутация: ${domain.reputation}`,
-          domain.maliciousVotes ? `Жалобы пользователей VT: ${domain.maliciousVotes}` : null,
-          domain.detections?.length ? `Детекты: ${formatDetections(domain.detections)}` : null,
-        ].filter(Boolean).join("\n");
-        await this.notifyAccount(account, message);
-        await this.storage.markAlertSent(key);
-        report.alerts.push(message);
-      }
-
       if (account.service === "virustotal_domains") {
         await this.storage.updateAccount(account.id, {
           lastDomainSecurityCheckDate: todayKey(),
           lastDomainSecurityCheckAt: new Date().toISOString(),
           lastDomainSecurityCheckCount: snapshot.domainsChecked ?? 0,
+          lastDomainSecurityAlerts: sanitizeDomainAlerts(snapshot.domainAlerts ?? []),
         });
+
+        if ((snapshot.domainAlerts ?? []).length) {
+          const key = ["domain-security-summary", account.id, new Date().toISOString().slice(0, 10)].join(":");
+          if (!this.storage.hasSentAlert(key)) {
+            const message = [
+              "У вас наблюдаются некоторые проблемы с несколькими доменами.",
+              `Аккаунт: ${account.name}`,
+              `Проблемных доменов: ${snapshot.domainAlerts.length}`,
+            ].join("\n");
+            await this.notifyAccount(
+              account,
+              message,
+              domainAlertsKeyboard(account.id),
+            );
+            await this.storage.markAlertSent(key);
+            report.alerts.push(message);
+          }
+        }
       }
     } catch (error) {
       console.error(`Ошибка проверки аккаунта ${account.service}/${account.name}:`, error.message);
@@ -177,9 +177,9 @@ export class Monitor {
     return report;
   }
 
-  async notifyAccount(account, text) {
+  async notifyAccount(account, text, replyMarkup = undefined) {
     const buyer = this.storage.getUser(account.buyerTelegramId);
-    if (buyer?.status === "active") await this.safeSend(buyer.telegramId, text);
+    if (buyer?.status === "active") await this.safeSend(buyer.telegramId, text, replyMarkup);
   }
 
   async notifyAdmins(text) {
@@ -190,9 +190,10 @@ export class Monitor {
     await Promise.all(admins.map((chatId) => this.safeSend(chatId, text)));
   }
 
-  async safeSend(chatId, text) {
+  async safeSend(chatId, text, replyMarkup = undefined) {
     try {
-      await this.telegram.sendMessage(chatId, escapeHtml(text));
+      const extra = replyMarkup ? { reply_markup: replyMarkup } : undefined;
+      await this.telegram.sendMessage(chatId, escapeHtml(text), extra);
     } catch (error) {
       console.error(`Failed to send Telegram message to ${chatId}:`, error.message);
     }
@@ -217,8 +218,7 @@ export function formatCheckReport(report, options = {}) {
   const statusErrors = (report.snapshot.statuses ?? [])
     .filter((status) => status.status === "error")
     .map((status, index) => `${index + 1}. ${status.label} — ${status.statusLabel ?? status.status}`);
-  const domainAlerts = (report.snapshot.domainAlerts ?? [])
-    .map((domain, index) => `${index + 1}. ${domain.label} — malicious ${domain.stats.malicious}, suspicious ${domain.stats.suspicious}, reputation ${domain.reputation}`);
+  const domainAlertCount = (report.snapshot.domainAlerts ?? []).length;
   const domainErrors = (report.snapshot.domainErrors ?? [])
     .slice(0, 8)
     .map((domain, index) => `${index + 1}. ${domain.domain}: ${domain.error}`);
@@ -235,7 +235,7 @@ export function formatCheckReport(report, options = {}) {
     `Сервис: ${formatService(report.account.service)}`,
     `Баланс: ${balance}`,
     domainCheckSummary,
-    domainAlerts.length ? `Проблемные домены:\n${domainAlerts.join("\n")}` : null,
+    domainAlertCount ? `Проблемные домены: ${domainAlertCount}. Подробности доступны по кнопке.` : null,
     domainErrors.length ? `Ошибки проверки доменов:\n${domainErrors.join("\n")}` : null,
     statusErrors.length ? `Ошибки статуса:\n${statusErrors.join("\n")}` : null,
     "",
@@ -273,6 +273,25 @@ function formatDetections(detections) {
   return detections
     .map((detection) => `${detection.engine}: ${detection.result ?? detection.category}`)
     .join("; ");
+}
+
+function sanitizeDomainAlerts(alerts) {
+  return alerts.map((alert) => ({
+    id: alert.id,
+    label: alert.label,
+    stats: alert.stats,
+    reputation: alert.reputation,
+    maliciousVotes: alert.maliciousVotes,
+    detections: alert.detections,
+  }));
+}
+
+function domainAlertsKeyboard(accountId) {
+  return {
+    inline_keyboard: [
+      [{ text: "Посмотреть все", callback_data: `domain_alerts:${accountId}` }],
+    ],
+  };
 }
 
 function emptyDomainSnapshot(account) {

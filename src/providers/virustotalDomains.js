@@ -3,6 +3,7 @@ const VIRUSTOTAL_BASE_URL = "https://www.virustotal.com/api/v3";
 const VIRUSTOTAL_BATCH_SIZE = 4;
 const VIRUSTOTAL_RATE_WINDOW_MS = 60 * 1000;
 const REQUEST_RETRIES = 3;
+const MALICIOUS_DETECTION_THRESHOLD = 3;
 
 export async function getVirustotalDomainsSnapshot(credentials, options = {}) {
   if (!credentials.apiKey || !credentials.opsvaultApiKey) {
@@ -205,7 +206,7 @@ function buildDomainAlert(domain, report) {
   const maliciousVotes = Number(votes.malicious ?? 0);
   const reputation = Number(attributes.reputation ?? 0);
 
-  if (malicious <= 0 && suspicious <= 0 && maliciousVotes <= 0 && reputation >= 0) return null;
+  if (malicious < MALICIOUS_DETECTION_THRESHOLD && maliciousVotes <= 0 && reputation >= 0) return null;
 
   return {
     id: domain.domain,
